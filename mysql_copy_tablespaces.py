@@ -1,34 +1,83 @@
+#!/usr/bin/env python
+
 from fabric import Connection
+import argparse
+import os
+import pwd
+import socket
 import sys
 import argparse
 
 # MySQL user/group
 MYSQL_USER = "mysql"
 MYSQL_GROUP = "mysql"
+SSH_OPTS_NOTTY = '-q -o PasswordAuthentication=no -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no'
+SSH_OPTS = '-tt %s' % SSH_OPTS_NOTTY
+SUDO_STR = ''
 
 
 def _read_argv():
     ### Check command line parameters
     res = dict()
     parser = argparse.ArgumentParser(description='mysql_copy_dbs.py - command line options')
-    parser.add_argument('src', default='', help='Source DB in this format: [user@]host:dbname')
-    parser.add_argument('dst', default='', help='Destination DB in this format: [user@]host:dbname')
-    parser.add_argument('--tmpdir', default='', help='(Optional) TMP dir on the destination server', required=False)
+    parser.add_argument('src', default='', help='Source DB in this format: [user@]host/dbname')
+    parser.add_argument('dst', default='', help='Destination DB in this format: [user@]host/dbname')
+    parser.add_argument('--tmpdir', default='/tmp', help='(Optional) TMP dir on the destination server', required=False)
     parser.add_argument('--copy', default='xtrabackup', help='(Optional) TODO: Method to copy data, default xtrabackup, other options: zfs, lvm (snapshots)', required=False)
-    parser.add_argument('--dst_internal_ip', default='',
-                        help='(Optional) Internal IP of the destination server (for copying xtrabackup)',
-                        required=False)
-    parser.add_argument('--force', default='', help='(Optional) Force overwriting DB', required=False,
+    parser.add_argument('--dst_internal_ip',
+                        help='(Optional) Internal IP of the destination server (for copying xtrabackup)')
+    parser.add_argument('--force', help='(Optional) Force overwriting DB', required=False,
                         action='store_true')
+    parser.add_argument('--skip-sudo', dest='sudo', help='Skip sudo privileges',
+                        action='store_false')
     args = parser.parse_args()
     src = args.src.split('/')
     dst = args.dst.split('/')
+
     # print (src, dst)
     res.update({'tmpdir': args.tmpdir, 'force': args.force, 'src_host': src[0], 'dst_host': dst[0],
-                'dst_internal_ip': args.dst_internal_ip, 'copy': args.copy})
+                'dst_internal_ip': args.dst_internal_ip, 'copy': args.copy, 'sudo': args.sudo})
+
+    mysql_owner = None
+
+    try:
+        user, host = src[0].split('@')
+        mysql_owner = user
+        res['src_host_ip'] = '%s@%s' % (user, socket.gethostbyname(host))
+    except ValueError, err:
+        res['src_host_ip'] = socket.gethostbyname(src[0])
+
+    try:
+        user, host = dst[0].split('@')
+        mysql_owner = user
+        host = socket.gethostbyname(host)
+        res['dst_host_ip'] = '%s@%s' % (user, host)
+        res['dst_internal_ip'] = host
+    except ValueError, err:
+        res['dst_host_ip'] = socket.gethostbyname(dst[0])
+
+    if args.dst_internal_ip is not None:
+        # make sure its really an IP
+        try:
+            res['dst_internal_ip'] = socket.gethostbyname(args.dst_internal_ip)
+        except ValueError, err:
+            parser.error('Invalid value for dst_internal_ip')
+
+    # We override default mysql/mysql user group ownership on destination server
+    # especially if user on dest is not root and not mysql. Instead we assume
+    # its the user we use to SSH, if its empty the user from the src, else the user
+    # who executed this script
+    if mysql_owner is None and not args.sudo:
+        mysql_owner = pwd.getpwuid(os.getuid())[0]
+
+    if mysql_owner == 'root':
+        mysql_owner = 'mysql'
+
+    res['mysql_uid'] = mysql_owner
+    res['mysql_gid'] = mysql_owner
+
     if len(src) == 1:
-        print("ERROR: Need to provide a list of databases in the format db1[,db2,db3]")
-        sys.exit(1)
+        parser.error("ERROR: Need to provide a list of databases in the format db1[,db2,db3]")
     else:
         res.update({'src_dbs': src[1].split(',')})
     if len(dst) == 1:
@@ -36,13 +85,27 @@ def _read_argv():
         res.update({'dst_dbs': src[1].split(',')})
     else:
         res.update({'dst_dbs': dst[1].split(',')})
+
+    if len(res['dst_dbs']) > len(res['src_dbs']):
+        parser.error('There is more destination databases than the number of sources')
+
+    res['db_maps'] = dict()
+    for i in range(len(res['src_dbs'])):
+        src_db = res['src_dbs'][i]
+        if i >= len(res['dst_dbs']):
+            print("--- WARNING: destination DB name not found for source DB {}, assuming the same name...".format(
+                src_db))
+            res['db_maps'][src_db] = src_db
+        else:
+            res['db_maps'][src_db] = res['dst_dbs'][i]
+
     print(res)
     return res
 
 
 def _connect(host, db=''):
     # Check connection first
-    c = Connection(host)
+    c = Connection(host, connect_timeout=2)
     hostname = get_hostname(c)
     print("Connection established to {}. Hostname reported: {}".format(host, hostname))
     # Check that MySQL is running and we can connect to it
@@ -50,9 +113,14 @@ def _connect(host, db=''):
     return c
 
 
-def run_command(c, cmd, hide=True, ignore=False):
+def run_command(c, cmd, hide=True, ignore=False, timeout=None):
     try:
-        res = c.run(cmd, hide=hide)
+        if SUDO_STR == '':
+            pty=False
+        else:
+            pty=True
+
+        res = c.run(cmd, hide=hide, pty=pty, timeout=timeout)
     except Exception as e:
         print("[ERROR] Can't run command {}, err: {}".format(cmd, str(e)))
         print("Please make sure you can sudo or use root AND you can connect to MySQL from root shell without password")
@@ -64,7 +132,7 @@ def run_command(c, cmd, hide=True, ignore=False):
 
 
 def check_connection_between_hosts(c, dst_host):
-    cmd = 'ssh {} "hostname"'.format(dst_host)
+    cmd = 'ssh {} {} "{} hostname"'.format(SSH_OPTS, dst_host, SUDO_STR)
     try:
         res = c.run(cmd, hide=False)
     except Exception as e:
@@ -77,23 +145,30 @@ def check_connection_between_hosts(c, dst_host):
 def get_hostname(c, dst_internal_ip=''):
     if dst_internal_ip:
         return dst_internal_ip
-    return run_command(c, 'uname -n')
+
+    # getting hostname should not take more than two seconds
+    # this allows us to capture for example when a user on the other
+    # end has not configured passwordless sudo which gets stuck in
+    # password capture
+    return run_command(c, '%suname -n' % SUDO_STR, timeout=2)
 
 
-def _run_mysql_query(c, db, sql, sudo=True, hide=True):
+def sudo_string(sudo=False):
     if sudo:
-        prefix = "sudo"
-    else:
-        prefix = ""
+        return 'sudo '
+
+    return ''
+
+def _run_mysql_query(c, db, sql, hide=True):
     if hide:
         mysql_verbose = ""
     else:
         mysql_verbose = " -vvv "
-    return run_command(c, "{} mysql {} -A -NB {} -e '{}'".format(prefix, mysql_verbose, db, sql), hide=hide)
+    return run_command(c, "{}mysql {} -A -NB {} -e '{}'".format(SUDO_STR, mysql_verbose, db, sql), hide=hide)
 
 
-def mysql_query(c, db, sql, sudo=True, hide=True):
-    return _run_mysql_query(c, db, sql, sudo, hide).split('\n')
+def mysql_query(c, db, sql, hide=True):
+    return _run_mysql_query(c, db, sql, hide).split('\n')
 
 
 def list_innodb_tables(c, db):
@@ -111,7 +186,7 @@ def _alter_table_tablespaces(c, db, op):
     q = "SET FOREIGN_KEY_CHECKS=0; "
     for t in TABLES:
         q = q + "; ALTER TABLE {}.{} {} TABLESPACE".format(db, t, op)
-    return mysql_query(c, db, q, True, False)
+    return mysql_query(c, db, q, False)
 
 
 def discard_tablespaces(c, db):
@@ -135,15 +210,16 @@ def create_database(c, db):
 
 
 def copy_schema(c, src_db, dst_host, dst_db):
-    cmd = "sudo mysqldump --no-data --triggers --single-transaction --set-gtid-purged=OFF --skip-add-locks {} | ssh {} sudo mysql {}".format(
-        src_db, dst_host, dst_db
+    cmd = "{}mysqldump --no-data --triggers --single-transaction --set-gtid-purged=OFF --skip-add-locks {} | ssh {} {} {}mysql {}".format(
+        SUDO_STR, src_db, SSH_OPTS_NOTTY, dst_host, SUDO_STR, dst_db
     )
     run_command(c, cmd)
 
 
 def create_tmp_dir(c, prefix='/tmp'):
     #if not tmpdir or tmpdir == '':
-    tmp_backup_dir = run_command(c, "mktemp -d -t mycpdb.XXXX -p {}".format(prefix))
+    tmp_backup_dir = run_command(c, "{}mktemp -d -t mycpdb.XXXX -p {}".format(SUDO_STR, prefix))
+    run_command(c, '{}chmod 0750 {}'.format(SUDO_STR, tmp_backup_dir))
     print("Created TMPDIR={}".format(tmp_backup_dir))
     #else:
     #    # TODO: check if it exists already
@@ -152,14 +228,19 @@ def create_tmp_dir(c, prefix='/tmp'):
 
 
 def make_backup(c, src_db, dst_host, tmp_backup_dir):
-    cmd = 'sudo xtrabackup --skip-tables-compatibility-check --backup --stream=xbstream --databases="{}" | ssh {} "xbstream -x -C {}"'.format(
-        src_db, dst_host, tmp_backup_dir
+    # Even with sudo we force --defaults-file ~/.my.cnf
+    # this means reading the .my.cnf of the non-root user 
+    # which we are using anyway, for non sudo is the same
+    # if we are using the root account, has the same effect
+    # SO we need to make sure ~/.my.cnf is a prerequisite
+    cmd = '{}xtrabackup --defaults-file=~/.my.cnf --skip-tables-compatibility-check --backup --stream=xbstream --databases="{}" --target-dir=. | ssh {} {} "{}xbstream -x -C {}"'.format(
+        SUDO_STR, src_db, SSH_OPTS_NOTTY, dst_host, SUDO_STR, tmp_backup_dir
     )
     run_command(c, cmd, False)
 
 
-def prepare_backup(c, tmp_backup_dir, params=" --export "):
-    cmd = 'sudo xtrabackup --prepare {} --target-dir={}'.format(params, tmp_backup_dir)
+def prepare_backup(c, tmp_backup_dir, params=" --export ", sudo=True):
+    cmd = '{}xtrabackup --prepare {} --target-dir={}'.format(SUDO_STR, params, tmp_backup_dir)
     run_command(c, cmd, True)
 
 def make_zfs_snaphost(c, zfs_opts=''):
@@ -173,21 +254,23 @@ def destroy_zfs_snaphost(c, src_db, zfs_opts=''):
     run_command(c, cmd, True)
 
 def copy_or_move_files(c, tmpdir, src_db, dst_db, op):
-    if op == "copy":
-        command = 'rsync -a'
-    else:
-        command = 'mv'
     datadir = get_datadir(c, dst_db)
-    for ext in 'ibd exp cfg'.split(' '):
-        files_cmd = "sudo {} {}/{}/*.{} {}/{}/".format(
-            command, tmpdir, src_db, ext, datadir, dst_db
-        )
-        run_command(c, files_cmd, False, True)
-    run_command(c, "sudo chown -R {}.{} {}/{}".format(MYSQL_USER, MYSQL_GROUP, datadir, dst_db), False)
+    if op == "copy":
+        command = '/bin/cp'
+    else:
+        command = '/bin/mv'
+    # instead of looping against all extensions we can use find 
+    # in cases where there is no exp and cfg mv or rsync fails
+    files_cmd = ("{}find {} -type f -name *.ibd -o -name *.cfg -o -name *.exp "
+                 "| {}xargs -I {{}} {} {{}} {}/").format(SUDO_STR, tmpdir, SUDO_STR, 
+                                                command, os.path.join(datadir, dst_db))
+    print(files_cmd)
+    run_command(c, files_cmd, False, True)
+    run_command(c, "{}chown -R {}.{} {}/{}".format(SUDO_STR, MYSQL_USER, MYSQL_GROUP, datadir, dst_db), False)
 
 
 def _change_master_cmd(c, tmpdir):
-    xtrabackup_binlog_info = run_command(c, 'cat {}/xtrabackup_binlog_info'.format(tmpdir))
+    xtrabackup_binlog_info = run_command(c, '{}cat {}/xtrabackup_binlog_info'.format(SUDO_STR, tmpdir))
     repl = xtrabackup_binlog_info.split('\t')
     if len(repl) < 2:
         print("Can't parse xtrabackup_binlog_info with {} / {}".format(xtrabackup_binlog_info, repl))
@@ -201,67 +284,81 @@ def mysql_set_repl(c, dst_db, change_master):
     repl_filter = 'CHANGE REPLICATION FILTER REPLICATE_WILD_DO_TABLE=("{}.%")'.format(dst_db)
     mysql_cmd = "stop slave; {}; {}; ".format(change_master, repl_filter)
     print(mysql_cmd)
-    mysql_query(c, '', mysql_cmd, True, False)
+    mysql_query(c, '', mysql_cmd, True)
 
 
 def main():
+    global SUDO_STR
+    global MYSQL_USER
+    global MYSQL_GROUP
+
     params = _read_argv()
+    SUDO_STR = sudo_string(params['sudo'])
+    MYSQL_USER = params['mysql_uid']
+    MYSQL_GROUP = params['mysql_gid']
+
     # Ensure connection, we will only check first DB from the list
-    print("Connecting to source host...")
-    src_host = params['src_host']
-    dst_host = params['dst_host']
-    c1 = _connect(src_host, params['src_dbs'][0])
-    print("Connecting to destination host...")
+    src_host = params['src_host_ip']
+    dst_host = params['dst_host_ip']
+    print("Connecting to source host ... %s" % src_host)
+    c1 = _connect(src_host)
+    print("Connecting to destination host ... %s" % dst_host)
     c2 = _connect(dst_host)
-    dst_internal_hostname = get_hostname(c2, params['dst_internal_ip'])
-    check_connection_between_hosts(c1, dst_internal_hostname)
+    
+    # Simply use dst_internal_ip if given, otherwise use the resolved ip from dst
+    check_connection_between_hosts(c1, params['dst_internal_ip'])
 
     # perform xtrabackup or snapshot BEFORE looping thru directories
     tmp_backup_dir = create_tmp_dir(c2, params['tmpdir'])
 
+    # Attempt to create databases first on dest, especially if force is not
+    # specified so we can fail early
+    for srcdb in params['db_maps']:
+        dstdb = params['db_maps'][srcdb]
+        print("Creating {} -> {}".format(srcdb, dstdb))
+        print("... Source DB: {}, Tables: {}".format(srcdb, list_innodb_tables(c1, srcdb)))
+        if database_exists(c2, dstdb):
+            if not params['force']:
+                raise Exception(("--- ERROR: DB {} exists on destination host with the following "
+                       "tables: {}! Aborting, use --force to override").format(
+                            dstdb, list_innodb_tables(c2, dstdb))
+                )
+            else:
+                print('--- WARNING: --force was specified, dropping existing destination tables')
+                dsttbls = list_innodb_tables(c1, dstdb)
+                for tbl in dsttbls:
+                    mysql_query(c2, dstdb, "DROP TABLE IF EXISTS {}".format(tbl))
+
     if params['copy'] == "xtrabackup":
         print("... making xtrabackup")
-        make_backup(c1, ' '.join(params['src_dbs']), dst_internal_hostname, tmp_backup_dir)
+        make_backup(c1, ' '.join(params['src_dbs']), params['dst_host_ip'], tmp_backup_dir)
         print("... preparing xtrabackup")
         prepare_backup(c2, tmp_backup_dir, '')
     else:
         print("Other methods are not supported yet...")
         sys.exit(1)
 
-    for i in range(len(params['src_dbs'])):
-        src_db = params['src_dbs'][i]
-        if i >= len(params['dst_dbs']):
-            print("--- WARNING: destination DB name not found for source DB {}, assuming the same name...".format(
-                params['src_dbs'][i]))
-            dst_db = params['src_dbs'][i]
-        else:
-            dst_db = params['dst_dbs'][i]
-        print("{} -> {}".format(src_db, dst_db))
-        print("... Source DB: {}, Tables: {}".format(src_db, list_innodb_tables(c1, src_db)))
-        if database_exists(c2, dst_db) and not params['force']:
-            print(
-                "--- ERROR: DB {} exits on destination host with the following tables: {}! Skipping this db, use --force to override".format(
-                    dst_db, list_innodb_tables(c2, dst_db))
-            )
-            continue
+    for srcdb in params['db_maps']:
+        dstdb = params['db_maps'][srcdb]
+        print("Importing {} -> {}".format(srcdb, dstdb))
 
         # Ensure we have dst_db
-        create_database(c2, dst_db)
+        create_database(c2, dstdb)
         # Now copy schema, run it on SOURCE:
-        print("... copying schema {}/{} -> {}/{}".format(src_host, src_db, dst_host, dst_db))
-        copy_schema(c1, src_db, dst_internal_hostname, dst_db)
+        print("... copying schema {}/{} -> {}/{}".format(src_host, srcdb, dst_host, dstdb))
+        copy_schema(c1, srcdb, params['dst_host_ip'], dstdb)
         print("Done! Copied schema to destination: {} (hostname: {}), db: {}, tables: {}".format(
-            dst_host, dst_internal_hostname, dst_db, list_innodb_tables(c2, dst_db)
+            dst_host, params['dst_host_ip'], dstdb, list_innodb_tables(c2, dstdb)
         ))
-        print("... discarding tablespaces for {}/{}".format(src_host, dst_db))
-        discard_tablespaces(c2, dst_db)
+        print("... discarding tablespaces for {}/{}".format(src_host, dstdb))
+        discard_tablespaces(c2, dstdb)
         print("... copying/moving files")
-        copy_or_move_files(c2, tmp_backup_dir, src_db, dst_db, 'move')
+        copy_or_move_files(c2, tmp_backup_dir, srcdb, dstdb, 'move')
         print("... importing tablespaces")
-        import_tablespaces(c2, dst_db)
-        print("Done with {}".format(dst_db))
+        import_tablespaces(c2, dstdb)
+        print("Done with {}".format(dstdb))
     print("... changing master binlog name and position + repl filter")
-    mysql_set_repl(c2, dst_db, _change_master_cmd(c2, tmp_backup_dir))
+    mysql_set_repl(c2, dstdb, _change_master_cmd(c2, tmp_backup_dir))
     print("All done!")
 
 
