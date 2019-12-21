@@ -99,7 +99,7 @@ def _read_argv():
         else:
             res['db_maps'][src_db] = res['dst_dbs'][i]
 
-    print(res)
+    #print(res)
     return res
 
 
@@ -142,6 +142,21 @@ def check_connection_between_hosts(c, dst_host):
         sys.exit(1)
 
 
+def check_src_dbs_fulltext(c, srcdbs):
+    sql = ('select count(1) as ns from {0}.innodb_sys_tables t '
+           'where t.name LIKE "{1}/FTS_%"')
+    db = 'information_schema'
+    for srcdb in srcdbs:
+        #print(sql.format(db, srcdb))
+        res = mysql_query(c, 'information_schema', sql.format(db, srcdb))
+        if type(res) is list:
+            res = int(res[0])
+            if res > 0:
+                raise Exception('ERROR: Source db %s has FULLTEXT indexes, this operation is not supported' % srcdb)
+        else:
+            raise Exception('ERROR: Unable to validate source db %s' % srcdb)
+
+
 def get_hostname(c, dst_internal_ip=''):
     if dst_internal_ip:
         return dst_internal_ip
@@ -158,6 +173,7 @@ def sudo_string(sudo=False):
         return 'sudo '
 
     return ''
+
 
 def _run_mysql_query(c, db, sql, hide=True):
     if hide:
@@ -243,15 +259,18 @@ def prepare_backup(c, tmp_backup_dir, params=" --export ", sudo=True):
     cmd = '{}xtrabackup --prepare {} --target-dir={}'.format(SUDO_STR, params, tmp_backup_dir)
     run_command(c, cmd, True)
 
+
 def make_zfs_snaphost(c, zfs_opts=''):
     zfp_mount = run_command('zfs list -o name,mountpoint|grep "{}" | cut -d " " -f 1'.format(get_datadir(c, '')))
     cmd= "zfs snapshot {}@copy.$$".format(zfp_mount)
     return run_command(c, cmd, False)
 
+
 def destroy_zfs_snaphost(c, src_db, zfs_opts=''):
     zfp_mount = run_command('zfs list -o name,mountpoint|grep "{}" | cut -d " " -f 1'.format(get_datadir(c, src_db)))
     cmd= "zfs destroy -t {}@copy.$$".format(zfp_mount)
     run_command(c, cmd, True)
+
 
 def copy_or_move_files(c, tmpdir, src_db, dst_db, op):
     datadir = get_datadir(c, dst_db)
@@ -304,6 +323,9 @@ def main():
     c1 = _connect(src_host)
     print("Connecting to destination host ... %s" % dst_host)
     c2 = _connect(dst_host)
+
+    # Make sure none of our src dbs has FULLTEXT indexes
+    check_src_dbs_fulltext(c1, params['db_maps'])
     
     # Simply use dst_internal_ip if given, otherwise use the resolved ip from dst
     check_connection_between_hosts(c1, params['dst_internal_ip'])
